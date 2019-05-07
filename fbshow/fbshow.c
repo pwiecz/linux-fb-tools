@@ -18,16 +18,19 @@
 #include <math.h>
 #include <fcntl.h>
 #include <stdio.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <unistd.h>
 #include <string.h>
 #include <assert.h>
 #include <jpeglib.h>
+#include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <linux/fb.h>
 #include <linux/kd.h>
+#include <setjmp.h>
 
 typedef struct _Color
 {
@@ -83,12 +86,14 @@ static int fb_write_rgb24(FBInfo* fb, unsigned char* dst, Color* color)
 	return 0;
 }
 
-static int fb_write_argb32(FBInfo* fb, unsigned char* dst, Color* color)
+static int fb_write_rgba32(FBInfo* fb, unsigned char* dst, Color* color)
 {
-	dst[0] = color->a;
-	dst[1] = color->r;
-	dst[2] = color->g;
-	dst[3] = color->b;
+	uint32_t c =
+		((uint32_t)color->r << fb->vi.red.offset) |
+		((uint32_t)color->g << fb->vi.green.offset) |
+		((uint32_t)color->b << fb->vi.blue.offset) |
+		((uint32_t)color->a << fb->vi.transp.offset);
+	memcpy(dst, &c, sizeof(uint32_t));
 
 	return 0;
 }
@@ -110,7 +115,7 @@ static void set_pixel_writer(FBInfo* fb)
 	}
 	else if(fb_bpp(fb) == 4)
 	{
-		fb->write = fb_write_argb32;
+		fb->write = fb_write_rgba32;
 	}
 	else
 	{
@@ -245,11 +250,10 @@ static Image* image_load_png(const char* filename)
 
 	png_init_io(png_ptr, fp);
 
-	memset(info_ptr, 0x00, sizeof(*info_ptr));
 	png_read_info(png_ptr, info_ptr);
 
-	w = info_ptr->width;
-	h = info_ptr->height;
+	w = png_get_image_width(png_ptr, info_ptr);
+	h = png_get_image_height(png_ptr, info_ptr);
 
 	passes_nr = png_set_interlace_handling(png_ptr);
 	png_read_update_info(png_ptr, info_ptr);
@@ -261,13 +265,15 @@ static Image* image_load_png(const char* filename)
 	row_pointers = (png_bytep*) calloc(1, h * sizeof(png_bytep));
 	for (y=0; y< h; y++)
 	{
-		row_pointers[y] = (png_byte*) calloc(1, info_ptr->rowbytes);
+		png_uint_32 rowbytes = png_get_rowbytes(png_ptr, info_ptr);
+		row_pointers[y] = (png_byte*) calloc(1, rowbytes);
 	}
 	png_read_image(png_ptr, row_pointers);
 
 	image = image_create(w, h);
 	dst = image_bits(image);
-	if (info_ptr->color_type == PNG_COLOR_TYPE_RGBA)
+	png_byte color_type = png_get_color_type(png_ptr, info_ptr);
+	if (color_type == PNG_COLOR_TYPE_RGBA)
 	{
 		for(y = 0; y < h; y++)
 		{
@@ -286,9 +292,11 @@ static Image* image_load_png(const char* filename)
 			}
 		}
 	}
-	else if(info_ptr->color_type == PNG_COLOR_TYPE_RGB)
+	else if(color_type == PNG_COLOR_TYPE_RGB)
 	{
-		if(0 == info_ptr->num_trans)
+		int num_trans;
+		png_get_tRNS(png_ptr, info_ptr, NULL, &num_trans, NULL);
+		if(0 == num_trans)
 		{
 			for(y = 0; y < h; y++)
 			{
@@ -306,10 +314,13 @@ static Image* image_load_png(const char* filename)
 		}
 		else 
 		{
+			png_color_16p trans_color;
+			png_get_tRNS(png_ptr, info_ptr, NULL, NULL, &trans_color);
+	
 #if PNG_LIBPNG_VER > 10399
-			png_byte red = png_ptr->trans_color.red & 0xff;
-			png_byte green = png_ptr->trans_color.green & 0xff;
-			png_byte blue = png_ptr->trans_color.blue & 0xff;
+			png_byte red = trans_color->red & 0xff;
+			png_byte green = trans_color->green & 0xff;
+			png_byte blue = trans_color->blue & 0xff;
 #else
 			png_byte red = png_ptr->trans_values.red & 0xff;
 			png_byte green = png_ptr->trans_values.green & 0xff;
